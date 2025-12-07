@@ -1,0 +1,29 @@
+accelerate launch train.py \
+    --experiment_name hifigan \
+    --working_directory work_dir \
+    --path_to_train_manifest data/train_metadata.csv \
+    --path_to_val_manifest data/test_metadata.csv \
+    --training_epochs 3100 \
+    --console_out_iters 5 \
+    --wandb_log_iters 5 \
+    --checkpoint_epochs 50 \
+    --batch_size 16 \
+    --learning_rate 0.0002 \
+    --beta1 0.8 \
+    --beta2 0.99 \
+    --lr_decay 0.999 \
+    --upsample_rates 8 8 2 2 \
+    --upsample_kernel_sizes 16 16 4 4 \
+    --resblock_kernel_sizes 3 7 11 \
+    --resblock_dilation_sizes "((1,3,5),(1,3,5),(1,3,5))" \
+    --mpd_periods 2 3 5 7 11 \
+    --sampling_rate 22050 \
+    --segment_size 8192 \
+    --num_mels 80 \
+    --n_fft 1024 \
+    --window_size 1024 \
+    --hop_size 256 \
+    --fmin 0 \
+    --fmax 8000 \
+    --num_workers 16 \
+    --log_wandb
