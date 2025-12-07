@@ -1,7 +1,3 @@
-"""
-This was copied from my Tacotron2 Folder!
-https://github.com/priyammaz/PyTorch-Adventures/tree/main/PyTorch%20for%20Audio/Tacotron2
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
