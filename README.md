@@ -25,6 +25,9 @@ The training logs and progress plots can be found within the _output/_ directory
 
 * Audio generated using the fine-tuned Tacotron2 model: _output/taco_output.wav_
 * Audio generated using Tacotron2 followed by HiFiGAN vocoding: _output/hifigan_output.wav_
+* Google drive link for audio example: https://drive.google.com/drive/u/0/folders/1RHGqb14wtM5vpSFfhr4_ofpPInUG9IWY
+* Our trained models: https://drive.google.com/drive/u/0/folders/1DGZh33uD6BGogCs9bHLjSqMxBvrgNmp9
+  
 
 ### Style Conditioning
 We also experimented with style-conditioned Tacotron2 by fine-tuning the base model on the [EmoV-DB](https://huggingface.co/datasets/CLAPv2/EmoV_DB/viewer) dataset _(tacotron2/style_conditioning)_. However, the results were not satisfactory. The mel predictions were unstable and the audio quality degraded.
