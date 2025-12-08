@@ -23,10 +23,13 @@ For evaluation, the _hifigan/inference.ipynb_ notebook demonstrates how Tacotron
 ## Outputs
 The training logs and progress plots can be found within the _output/_ directory. 
 
-* Audio generated using the fine-tuned Tacotron2 model: _output/taco_output.wav_
-* Audio generated using Tacotron2 followed by HiFiGAN vocoding: _output/hifigan_output.wav_
+* Inference script: _hifigan/inference.ipynb_
+* Evaluation: MOS - 3.3924;; WER - 0.1075. Refer _hifigan/evaluation.ipynb_
+* Example Audio generated using the fine-tuned Tacotron2 model: _output/taco_output.wav_
+* Example Audio generated using Tacotron2 followed by HiFiGAN vocoding: _output/hifigan_output.wav_
 * Google drive link for audio example: https://drive.google.com/drive/u/0/folders/1RHGqb14wtM5vpSFfhr4_ofpPInUG9IWY
 * Our trained models: https://drive.google.com/drive/u/0/folders/1DGZh33uD6BGogCs9bHLjSqMxBvrgNmp9
+
   
 
 ### Style Conditioning
