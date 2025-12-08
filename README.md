@@ -1,7 +1,7 @@
 # Text-to-speech-using-GenAI
 
 ## Dataset
-We will be using the LJSpeech dataset. It has nearly 13100 clips of high quality audio. _Taco2/prep_splits.py_ preprocesses the _LJSpeech_ dataset by loading normalized transcripts, generating absolute audio paths, computing durations, and splitting the data into train/test sets. It then sorts the training samples by duration and saves the results to _datasplit/train_metadata.csv_ and _datasplit/test_metadata.csv_.
+We will be using the [LJSpeech](https://keithito.com/LJ-Speech-Dataset/) dataset. It has nearly 13100 clips of high quality audio. _Taco2/prep_splits.py_ preprocesses the _LJSpeech_ dataset by loading normalized transcripts, generating absolute audio paths, computing durations, and splitting the data into train/test sets. It then sorts the training samples by duration and saves the results to _datasplit/train_metadata.csv_ and _datasplit/test_metadata.csv_.
 
 ## Training Tacotron2
 _Taco2/train_taco.py_ script provides a complete Tacotron2 training pipeline using HuggingFace Accelerate for distributed and mixed-precision training. It loads preprocessed LJSpeech metadata, generates mel-spectrograms on the fly, and batches data using a length-aware sampler and custom collator. The Tacotron2 architecture is fully configurable—covering encoder/decoder layers, prenet/postnet settings, and attention mechanisms. During training, the model predicts both coarse and postnet-refined mel spectrograms as well as stop tokens, optimized using a combination of mel MSE, refined mel MSE, and BCE stop-token loss. The script performs gradient clipping, synchronized updates across devices, optional LR scheduling, and logs metrics to the console or Weights & Biases. It also evaluates on a validation set each epoch and saves mel/attention visualizations for inspection. Checkpoints are automatically stored throughout training, and a final checkpoint is written at the end of training for future inference or fine-tuning.
@@ -26,3 +26,5 @@ The training logs and progress plots can be found within the _output/_ directory
 * Audio generated using the fine-tuned Tacotron2 model: _output/taco_output.wav_
 * Audio generated using Tacotron2 followed by HiFiGAN vocoding: _output/hifigan_output.wav_
 
+### Style Conditioning
+We also experimented with style-conditioned Tacotron2 by fine-tuning the base model on the [EmoV-DB](https://huggingface.co/datasets/CLAPv2/EmoV_DB/viewer) dataset _(tacotron2/style_conditioning)_. However, the results were not satisfactory. The mel predictions were unstable and the audio quality degraded.
