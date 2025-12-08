@@ -1,30 +1,31 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from dataclasses import dataclass
-
-################################################################################
-# CONFIG
-################################################################################
 
 @dataclass
 class Tacotron2Config:
 
     ### Mel Input Features ###
-    num_mels: int = 80
+    num_mels: int = 80 
 
     ### Character Embeddings ###
     character_embed_dim: int = 512
     num_chars: int = 67
     pad_token_id: int = 0
 
+    ### Emotion Embeddings ###
+    use_emotions: bool = False
+    num_emotions: int = 0  # Will be set based on dataset
+    emotion_embed_dim: int = 64  # Dimension of emotion embedding
+
     ### Encoder config ###
     encoder_kernel_size: int = 5
     encoder_n_convolutions: int = 3
     encoder_embed_dim: int = 512
     encoder_dropout_p: float = 0.5
-
+    
     ### Decoder Config ###
     decoder_embed_dim: int = 1024
     decoder_prenet_dim: int = 256
@@ -42,466 +43,627 @@ class Tacotron2Config:
     attention_location_kernel_size: int = 31
     attention_dropout_p: float = 0.1
 
-    ### === EMOTION ADDITIONS ===
-    num_emotions: int = 0              # set >0 when fine-tuning on emotion dataset
-    emotion_embed_dim: int = 0         # e.g., 64
-
-
-
-################################################################################
-# BASIC LAYERS
-################################################################################
-
 class LinearNorm(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, w_init_gain="linear"):
-        super().__init__()
+    """
+    Standard Linear layer with different intialization strategies
+    """
+    def __init__(self, 
+                 in_features, 
+                 out_features, 
+                 bias=True, 
+                 w_init_gain="linear"):
+        
+        super(LinearNorm, self).__init__()
+        
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        torch.nn.init.xavier_uniform_(self.linear.weight, gain=torch.nn.init.calculate_gain(w_init_gain))
+
+        torch.nn.init.xavier_uniform_(
+            self.linear.weight, 
+            gain=torch.nn.init.calculate_gain(w_init_gain)
+        )
 
     def forward(self, x):
         return self.linear(x)
-
+    
 
 class ConvNorm(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=1, stride=1,
-                 padding=None, dilation=1, bias=True, w_init_gain="linear"):
-        super().__init__()
+    """
+    Standard Convolutional layer with different intialization strategies
+    """
+    def __init__(self, 
+                 in_channels,
+                 out_channels, 
+                 kernel_size=1, 
+                 stride=1, 
+                 padding=None, 
+                 dilation=1, 
+                 bias=True, 
+                 w_init_gain="linear"):
+        
+        super(ConvNorm, self).__init__()
 
         if padding is None:
             padding = "same"
 
         self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size=kernel_size,
-            stride=stride, padding=padding, dilation=dilation, bias=bias
+            in_channels, out_channels, kernel_size=kernel_size, 
+            stride=stride, padding=padding, dilation=dilation, 
+            bias=bias
         )
 
-        torch.nn.init.xavier_uniform_(self.conv.weight,
-            gain=torch.nn.init.calculate_gain(w_init_gain))
+        torch.nn.init.xavier_uniform_(
+            self.conv.weight, gain=torch.nn.init.calculate_gain(w_init_gain))
 
     def forward(self, x):
         return self.conv(x)
-
-
-################################################################################
-# ENCODER
-################################################################################
-
+        
 class Encoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
 
-        self.embeddings = nn.Embedding(
-            config.num_chars,
-            config.character_embed_dim,
-            padding_idx=config.pad_token_id
-        )
+    """
+    Learns embeddings on input characters from text
+    """
+    def __init__(self, config):
+        super(Encoder, self).__init__()
+        
+        self.config = config
+
+        self.embeddings = nn.Embedding(config.num_chars, config.character_embed_dim, padding_idx=config.pad_token_id)
 
         self.convolutions = nn.ModuleList()
+
         for i in range(config.encoder_n_convolutions):
-            self.convolutions.append(nn.Sequential(
-                ConvNorm(
-                    in_channels=config.encoder_embed_dim if i > 0 else config.character_embed_dim,
-                    out_channels=config.encoder_embed_dim,
-                    kernel_size=config.encoder_kernel_size,
-                    w_init_gain="relu"
-                ),
-                nn.BatchNorm1d(config.encoder_embed_dim),
-                nn.ReLU(),
-                nn.Dropout(config.encoder_dropout_p),
-            ))
+            
+            self.convolutions.append(
+                nn.Sequential(
+                    ConvNorm(
+                        in_channels=config.encoder_embed_dim if i != 0 else config.character_embed_dim,
+                        out_channels=config.encoder_embed_dim, 
+                        kernel_size=config.encoder_kernel_size,
+                        stride=1, 
+                        padding="same", 
+                        dilation=1, 
+                        w_init_gain="relu"
+                    ),
 
-        self.lstm = nn.LSTM(
-            input_size=config.encoder_embed_dim,
-            hidden_size=config.encoder_embed_dim // 2,
-            batch_first=True,
-            bidirectional=True,
-        )
+                    nn.BatchNorm1d(config.encoder_embed_dim), 
+                    nn.ReLU(), 
+                    nn.Dropout(config.encoder_dropout_p)
+                )
+            ) 
 
-    def forward(self, x, input_lengths=None):
-        x = self.embeddings(x).transpose(1, 2)  # (B, embed, T)
-        B, _, seq_len = x.shape
+        self.lstm = nn.LSTM(input_size=config.encoder_embed_dim, 
+                            hidden_size=config.encoder_embed_dim//2,
+                            num_layers=1, 
+                            batch_first=True, 
+                            bidirectional=True)
+        
+        # Emotion embedding layer
+        if config.use_emotions and config.num_emotions > 0:
+            self.emotion_embedding = nn.Embedding(config.num_emotions, config.emotion_embed_dim)
+            # Project emotion embedding to encoder dimension to add to encoder output
+            self.emotion_proj = LinearNorm(config.emotion_embed_dim, config.encoder_embed_dim, bias=False)
+        else:
+            self.emotion_embedding = None
+            self.emotion_proj = None
+        
+    def forward(self, x, input_lengths=None, emotion_ids=None):
+
+        ### Embed Tokens and transpose to (B x E x T) ###
+        x = self.embeddings(x).transpose(1,2)
+
+        batch_size, channels, seq_len = x.shape
+
         if input_lengths is None:
-            input_lengths = torch.full((B,), seq_len, device=x.device)
+            input_lengths = torch.full((batch_size, ), fill_value=seq_len, device=x.device)
 
         for block in self.convolutions:
             x = block(x)
 
-        x = x.transpose(1, 2)  # (B, T, embed)
+        ### Convert to BxLxE ###
+        x = x.transpose(1,2)
 
+        ### Pack Padded Sequence so LSTM doesnt Process Pad Tokens ###
+        ### This requires data to be sorted in longest to shortest!! ###
         x = pack_padded_sequence(x, input_lengths.cpu(), batch_first=True)
+    
+        ### Pass Data through LSTM ###
         outputs, _ = self.lstm(x)
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)
+
+        ### Pad Packed Sequence ###
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(
+            outputs, batch_first=True
+        )
+        
+        # Add emotion conditioning to encoder output
+        if self.emotion_embedding is not None and emotion_ids is not None:
+            # Get emotion embeddings: (B, emotion_embed_dim)
+            emotion_emb = self.emotion_embedding(emotion_ids)
+            # Project to encoder dimension
+            emotion_emb = self.emotion_proj(emotion_emb)
+            # Broadcast and add to encoder outputs: (B, encoder_embed_dim) -> (B, 1, encoder_embed_dim)
+            outputs = outputs + emotion_emb.unsqueeze(1)
 
         return outputs
-
-
-################################################################################
-# PRENET
-################################################################################
-
+    
 class Prenet(nn.Module):
-    def __init__(self, input_dim, prenet_dim, depth, dropout_p=0.5):
-        super().__init__()
+
+    """
+    At each decoder step, we will pass the previous timestep through the prenet.
+    This helps with both feature extraction and keeping stochasticity due to non-optional
+    dropout
+    """
+    def __init__(self, 
+                 input_dim, 
+                 prenet_dim, 
+                 prenet_depth,
+                 dropout_p=0.5):
+        super(Prenet, self).__init__()
+
         self.dropout_p = dropout_p
 
-        dims = [input_dim] + [prenet_dim] * depth
-        self.layers = nn.ModuleList()
+        dims = [input_dim] + [prenet_dim for _ in range(prenet_depth)]
 
+        self.layers = nn.ModuleList()
+        
         for in_dim, out_dim in zip(dims[:-1], dims[1:]):
-            self.layers.append(nn.Sequential(
-                LinearNorm(in_dim, out_dim, bias=False, w_init_gain="relu"),
-                nn.ReLU(),
-            ))
+            self.layers.append(
+
+                nn.Sequential(
+                    LinearNorm(
+                        in_features=in_dim, 
+                        out_features=out_dim,
+                        bias=False, 
+                        w_init_gain="relu"
+                    ),
+                    nn.ReLU(),
+                )
+            )
 
     def forward(self, x):
-        # dropout always on (tacotron2 style)
         for layer in self.layers:
+
+            ### Even during inference we leave this dropout enabled to "introduce output variation" ###
             x = F.dropout(layer(x), p=self.dropout_p, training=True)
+
         return x
-
-
-################################################################################
-# ATTENTION MECHANISM
-################################################################################
-
+    
 class LocationLayer(nn.Module):
-    def __init__(self, n_filters, kernel_size, attention_dim):
-        super().__init__()
-        self.conv = ConvNorm(2, n_filters, kernel_size, padding="same", bias=False)
-        self.proj = LinearNorm(n_filters, attention_dim, bias=False, w_init_gain="tanh")
+    
+    """
+    This module looks at our Current attention weights (how much emphasis is
+    this decoder step placing on all the input characters) as well as the
+    cumulative attention weights (how much emphasis have we already put
+    on all the input characters) and uses a convolution to extract features from them
+    """
+    def __init__(self, 
+                 attention_n_filters, 
+                 attention_kernel_size, 
+                 attention_dim):
+        super(LocationLayer, self).__init__()
 
-    def forward(self, attn):
-        x = self.conv(attn).transpose(1, 2)
-        return self.proj(x)
+        self.conv = ConvNorm(
+            in_channels=2, 
+            out_channels=attention_n_filters, 
+            kernel_size=attention_kernel_size, 
+            padding="same",
+            bias=False
+        )
+
+        self.proj = LinearNorm(attention_n_filters, attention_dim, bias=False, w_init_gain="tanh")
+
+    def forward(self, attention_weights):
+        attention_weights = self.conv(attention_weights).transpose(1,2)
+        attention_weights = self.proj(attention_weights)
+        return attention_weights
 
 
 class LocalSensitiveAttention(nn.Module):
-    def __init__(self, attention_dim, decoder_hidden_size, encoder_hidden_size,
-                 n_filters, kernel_size):
-        super().__init__()
 
-        self.decoder_proj = LinearNorm(decoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
-        self.encoder_proj = LinearNorm(encoder_hidden_size, attention_dim, bias=False, w_init_gain="tanh")
-        self.location_layer = LocationLayer(n_filters, kernel_size, attention_dim)
+    """
+    The most important part of our model! It looks at:
+    - The entire encoded text output
+    - Our current decoder step for mel generation
+    - Attention weights of how much emphasis have we already placed on the different encoder outputs
+    """
+    def __init__(self, 
+                 attention_dim, 
+                 decoder_hidden_size,
+                 encoder_hidden_size, 
+                 attention_n_filters, 
+                 attention_kernel_size):
+        super(LocalSensitiveAttention, self).__init__()
+
+        self.in_proj = LinearNorm(decoder_hidden_size, attention_dim, bias=True, w_init_gain="tanh")
+        self.enc_proj = LinearNorm(encoder_hidden_size, attention_dim, bias=False, w_init_gain="tanh")
+        
+        self.what_have_i_said = LocationLayer(
+            attention_n_filters, 
+            attention_kernel_size, 
+            attention_dim
+        )
+
         self.energy_proj = LinearNorm(attention_dim, 1, bias=False, w_init_gain="tanh")
-        self.enc_cache = None
+
+        self.reset()
 
     def reset(self):
-        self.enc_cache = None
+        self.enc_proj_cache = None
 
-    def compute_energies(self, query, encoder_output, cumulative_attn, mask):
+    def _calculate_alignment_energies(self, 
+                                      mel_input, 
+                                      encoder_output, 
+                                      cumulative_attention_weights, 
+                                      mask=None):
 
-        # project decoder state
-        query_proj = self.decoder_proj(query).unsqueeze(1)
+        ### Take our previous step of the mel sequence and project it (B x 1 x attention_dim)
+        mel_proj = self.in_proj(mel_input).unsqueeze(1)
 
-        # project encoder output (cached)
-        if self.enc_cache is None:
-            self.enc_cache = self.encoder_proj(encoder_output)
+        ### Take our entire encoder output and project it (B x encoder_len x attention_dim)
+        if self.enc_proj_cache is None:
+            self.enc_proj_cache = self.enc_proj(encoder_output)
 
-        # location features
-        loc = self.location_layer(cumulative_attn)
+        ### Look at our attention weight history to understand where the model has already placed attention 
+        cumulative_attention_weights = self.what_have_i_said(cumulative_attention_weights)
 
-        energies = self.energy_proj(torch.tanh(query_proj + self.enc_cache + loc)).squeeze(-1)
-
+        ### Broadcast sum the single mel timestep over all of our encoder timesteps (both attention weight features and encoder features)
+        ### And scale with tanh to get scores between -1 and 1, and project to a single value to comput energies
+        energies = self.energy_proj(
+            torch.tanh(
+                mel_proj + self.enc_proj_cache + cumulative_attention_weights
+            )
+        ).squeeze(-1)
+        
+        ### Mask out pad regions (dont want to weight pad tokens from encoder)
         if mask is not None:
-            energies = energies.masked_fill(mask.bool(), -1e9)
-
+            energies = energies.masked_fill(mask.bool(), -float("inf"))
+        
         return energies
+    
+    def forward(self, 
+                mel_input, 
+                encoder_output, 
+                cumulative_attention_weights, 
+                mask=None):
 
-    def forward(self, query, encoder_output, cumulative_attn, mask):
-        energies = self.compute_energies(query, encoder_output, cumulative_attn, mask)
-        attn_weights = F.softmax(energies, dim=1)
-        context = torch.bmm(attn_weights.unsqueeze(1), encoder_output).squeeze(1)
-        return context, attn_weights
+        ### Compute energies ###
+        energies = self._calculate_alignment_energies(mel_input, 
+                                                      encoder_output, 
+                                                      cumulative_attention_weights, 
+                                                      mask)
+        
+        ### Convert to Probabilities (relation of our mel input to all the encoder outputs) ###
+        attention_weights = F.softmax(energies, dim=1)
 
+        ### Weighted average of our encoder states by the learned probabilities 
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), encoder_output).squeeze(1)
 
-################################################################################
-# POSTNET
-################################################################################
+        return attention_context, attention_weights
 
 class PostNet(nn.Module):
-    def __init__(self, num_mels, n_convs, n_filters, kernel_size, dropout):
-        super().__init__()
+
+    """
+    To take final generated Mel from LSTM and postprocess to allow for
+    any missing details to be added in (learns the residual!)
+    """
+    def __init__(self, 
+                 num_mels, 
+                 postnet_num_convs=5, 
+                 postnet_n_filters=512, 
+                 postnet_kernel_size=5,
+                 postnet_dropout_p=0.5):
+        
+        super(PostNet, self).__init__()
 
         self.convs = nn.ModuleList()
 
-        # First conv
-        self.convs.append(nn.Sequential(
-            ConvNorm(num_mels, n_filters, kernel_size, padding="same", w_init_gain="tanh"),
-            nn.BatchNorm1d(n_filters),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-        ))
+        self.convs.append(
+            nn.Sequential(
+                ConvNorm(num_mels, 
+                         postnet_n_filters, 
+                         kernel_size=postnet_kernel_size, 
+                         padding="same",
+                         w_init_gain="tanh"), 
 
-        # Middle convs
-        for _ in range(n_convs - 2):
-            self.convs.append(nn.Sequential(
-                ConvNorm(n_filters, n_filters, kernel_size, padding="same", w_init_gain="tanh"),
-                nn.BatchNorm1d(n_filters),
-                nn.Tanh(),
-                nn.Dropout(dropout),
-            ))
+                nn.BatchNorm1d(postnet_n_filters),
+                nn.Tanh(), 
+                nn.Dropout(postnet_dropout_p)
+            )
+        )
 
-        # Final conv
-        self.convs.append(nn.Sequential(
-            ConvNorm(n_filters, num_mels, kernel_size, padding="same"),
-            nn.BatchNorm1d(num_mels),
-            nn.Dropout(dropout),
-        ))
+        for _ in range(postnet_num_convs - 2):
+            
+            self.convs.append(
+                nn.Sequential(
+                    ConvNorm(postnet_n_filters, 
+                             postnet_n_filters, 
+                             kernel_size=postnet_kernel_size, 
+                             padding="same",
+                             w_init_gain="tanh"), 
 
+                    nn.BatchNorm1d(postnet_n_filters),
+                    nn.Tanh(), 
+                    nn.Dropout(postnet_dropout_p)
+                )
+            )
+
+        self.convs.append(
+            nn.Sequential(
+                    ConvNorm(postnet_n_filters, 
+                             num_mels, 
+                             kernel_size=postnet_kernel_size, 
+                             padding="same"), 
+
+                    nn.BatchNorm1d(num_mels),
+                    nn.Dropout(postnet_dropout_p)
+                )
+        )
+    
     def forward(self, x):
-        x = x.transpose(1, 2)
-        for block in self.convs:
-            x = block(x)
-        return x.transpose(1, 2)
-
-
-################################################################################
-# DECODER (WITH EMOTION INJECTION)
-################################################################################
+        
+        x = x.transpose(1,2)
+        for conv_block in self.convs:
+            x = conv_block(x)
+        x = x.transpose(1,2)
+        return x
 
 class Decoder(nn.Module):
     def __init__(self, config):
-        super().__init__()
+        super(Decoder, self).__init__()
+
         self.config = config
 
-        self.prenet = Prenet(config.num_mels, config.decoder_prenet_dim,
-                             config.decoder_prenet_depth, config.decoder_prenet_dropout_p)
+        ### Predictions from previous timestep passed through a few linear layers ###
+        self.prenet = Prenet(input_dim=self.config.num_mels,
+                             prenet_dim=self.config.decoder_prenet_dim, 
+                             prenet_depth=self.config.decoder_prenet_depth)
 
-        # 2 LSTM layers
-        self.rnn = nn.ModuleList([
-            nn.LSTMCell(config.decoder_prenet_dim + config.encoder_embed_dim, config.decoder_embed_dim),
-            nn.LSTMCell(config.decoder_embed_dim + config.encoder_embed_dim, config.decoder_embed_dim),
-        ])
-
-        self.attention = LocalSensitiveAttention(
-            config.attention_dim,
-            config.decoder_embed_dim,
-            config.encoder_embed_dim,
-            config.attention_location_n_filters,
-            config.attention_location_kernel_size,
+        ### LSTMs Module to Process Concatenated PreNet output and Attention Context Vector ###
+        self.rnn = nn.ModuleList(
+            [
+                nn.LSTMCell(config.decoder_prenet_dim + config.encoder_embed_dim, config.decoder_embed_dim), 
+                nn.LSTMCell(config.decoder_embed_dim + config.encoder_embed_dim, config.decoder_embed_dim)
+            ]
         )
-
+   
+        ### Local Sensitive Attention Module ###
+        self.attention = LocalSensitiveAttention(attention_dim=config.attention_dim, 
+                                                 decoder_hidden_size=config.decoder_embed_dim,
+                                                 encoder_hidden_size=config.encoder_embed_dim, 
+                                                 attention_n_filters=config.attention_location_n_filters, 
+                                                 attention_kernel_size=config.attention_location_kernel_size)
+        
+        ### Predict Next Mel ###
         self.mel_proj = LinearNorm(config.decoder_embed_dim + config.encoder_embed_dim, config.num_mels)
-        self.stop_proj = LinearNorm(config.decoder_embed_dim + config.encoder_embed_dim, 1,
-                                    w_init_gain="sigmoid")
+        self.stop_proj = LinearNorm(config.decoder_embed_dim + config.encoder_embed_dim, 1, w_init_gain="sigmoid")
 
+        ### Post Process Predicted Mel ###
         self.postnet = PostNet(
-            config.num_mels,
-            config.decoder_postnet_num_convs,
-            config.decoder_postnet_n_filters,
-            config.decoder_postnet_kernel_size,
-            config.decoder_postnet_dropout_p,
+            num_mels=config.num_mels, 
+            postnet_num_convs=config.decoder_postnet_num_convs,
+            postnet_n_filters=config.decoder_postnet_n_filters, 
+            postnet_kernel_size=config.decoder_postnet_kernel_size,
+            postnet_dropout_p=config.decoder_postnet_dropout_p
         )
 
-        # === EMOTION ADDITION (decoder only): THESE GET POPULATED BY Tacotron2 CLASS ===
-        self.emotion_embedding = None
-        self.emotion_to_hidden = None
+    def _init_decoder(self, encoder_outputs, encoder_mask=None):
 
-    # ========= EMOTION INJECTION INTO DECODER INITIAL STATE ===========
-    def inject_emotion(self, emotion_ids):
-        """Inject emotion bias into decoder cell hidden states."""
-        if (self.emotion_embedding is None) or (emotion_ids is None):
-            return
-
-        # (B, embed_dim)
-        emo_vec = self.emotion_embedding(emotion_ids)
-
-        # (B, decoder_embed_dim)
-        emo_proj = self.emotion_to_hidden(emo_vec)
-
-        # add into decoder hidden init state
-        self.h[0] = self.h[0] + emo_proj
-        self.h[1] = self.h[1] + emo_proj
-
-
-    ####################################################################
-    # Initialization and decode
-    ####################################################################
-
-    def _init_decoder(self, encoder_outputs, encoder_mask, emotion_ids=None):
         B, S, E = encoder_outputs.shape
         device = encoder_outputs.device
 
+        ### Initialize Memory for two LSTM Cells ###
         self.h = [torch.zeros(B, self.config.decoder_embed_dim, device=device) for _ in range(2)]
         self.c = [torch.zeros(B, self.config.decoder_embed_dim, device=device) for _ in range(2)]
 
-        self.attn_weight = torch.zeros(B, S, device=device)
-        self.cumulative_attn_weight = torch.zeros(B, S, device=device)
+        ### Initialize Cumulative Attention ###
+        self.cumulative_attn_weight = torch.zeros(B,S, device=device)
+        self.attn_weight = torch.zeros(B,S, device=device)
         self.attn_context = torch.zeros(B, self.config.encoder_embed_dim, device=device)
 
+        ### Store Encoder Outputs ##
         self.encoder_outputs = encoder_outputs
         self.encoder_mask = encoder_mask
 
-        # === ADD EMOTION BIAS HERE ===
-        if emotion_ids is not None:
-            self.inject_emotion(emotion_ids)
+    def _bos_frame(self, B):
+        start_frame_zeros = torch.zeros(B, 1, self.config.num_mels)
+        return start_frame_zeros
 
 
-    def _start_frame(self, B, device):
-        return torch.zeros(B, 1, self.config.num_mels, device=device)
+    def decode(self, mel_step):
 
-
-    def decode_step(self, mel_step):
         rnn_input = torch.cat([mel_step, self.attn_context], dim=-1)
 
-        # LSTM 1
+        ### Pass RNN Input into first LSTMCell ### 
         self.h[0], self.c[0] = self.rnn[0](rnn_input, (self.h[0], self.c[0]))
+
+        ### Dropout ###
         attn_hidden = F.dropout(self.h[0], self.config.attention_dropout_p, self.training)
 
-        # attention
-        attn_cat = torch.cat(
-            [self.attn_weight.unsqueeze(1),
-             self.cumulative_attn_weight.unsqueeze(1)], dim=1
+        ### Concat cumulative and prev weights ###
+        attn_weights_cat = torch.cat(
+            [
+                self.attn_weight.unsqueeze(1), self.cumulative_attn_weight.unsqueeze(1)
+            ], dim=1
         )
 
-        context, attn = self.attention(attn_hidden, self.encoder_outputs, attn_cat, mask=self.encoder_mask)
+        ### Compute Attention on Hidden State ###
+        attention_context, attention_weights = self.attention(
+            attn_hidden, 
+            self.encoder_outputs, 
+            attn_weights_cat, 
+            mask=self.encoder_mask
+        )
 
-        self.attn_weight = attn
-        self.cumulative_attn_weight += attn
-        self.attn_context = context
+        self.attn_weight = attention_weights
+        self.cumulative_attn_weight = self.cumulative_attn_weight + attention_weights
+        self.attn_context = attention_context
 
-        # LSTM 2
-        rnn_input2 = torch.cat([attn_hidden, context], dim=-1)
-        self.h[1], self.c[1] = self.rnn[1](rnn_input2, (self.h[1], self.c[1]))
+        ### Get Decoder Input ###
+        decoder_input = torch.cat([attn_hidden, self.attn_context], dim=-1)
+
+        self.h[1], self.c[1] = self.rnn[1](decoder_input, (self.h[1], self.c[1]))
+
         decoder_hidden = F.dropout(self.h[1], self.config.decoder_dropout_p, self.training)
 
-        proj_input = torch.cat([decoder_hidden, context], dim=-1)
-        mel_pred = self.mel_proj(proj_input)
-        stop_pred = self.stop_proj(proj_input)
+        ### Projections ###
+        next_pred_input = torch.cat([decoder_hidden, self.attn_context], dim=-1)
 
-        return mel_pred, stop_pred, attn
+        mel_out = self.mel_proj(next_pred_input)
+        stop_out = self.stop_proj(next_pred_input)
 
+        return mel_out, stop_out, attention_weights
 
-    ####################################################################
-    # Forward (Teacher Forced)
-    ####################################################################
+    def forward(self,
+                encoder_outputs,
+                encoder_mask, 
+                mels, 
+                decoder_mask):
+        
+        ### When Decoding Start with Zero Feature Vector ###
+        start_feature_vector = self._bos_frame(mels.shape[0]).to(encoder_outputs.device)
+        mels_w_start = torch.cat([start_feature_vector, mels], dim=1)
+        
+        self._init_decoder(encoder_outputs, encoder_mask)
 
-    def forward(self, encoder_outputs, encoder_mask, mels, decoder_mask, emotion_ids=None):
+        ### Create lists to store Intermediate Outputs ###
+        mel_outs, stop_tokens, attention_weights = [], [], []
+        
+        ### Teacher forcing for T Steps ###
+        T_dec = mels.shape[1]
 
-        B = mels.size(0)
-        device = mels.device
+        ### Project Mel Spectrograms by PreNet ###
+        mel_proj = self.prenet(mels_w_start)
 
-        start = self._start_frame(B, device)
-        mels_w_start = torch.cat([start, mels], dim=1)
-
-        self._init_decoder(encoder_outputs, encoder_mask, emotion_ids=emotion_ids)
-
-        mel_outs = []
-        stop_outs = []
-        attns = []
-
-        prenet_out = self.prenet(mels_w_start)
-
-        T = mels.size(1)
-        for t in range(T):
+        ### Loop through T timesteps ###
+        for t in range(T_dec):
 
             if t == 0:
                 self.attention.reset()
 
-            mel_pred, stop_pred, attn = self.decode_step(prenet_out[:, t, :])
+            step_input = mel_proj[:, t, :]
 
-            mel_outs.append(mel_pred)
-            stop_outs.append(stop_pred)
-            attns.append(attn)
+            mel_out, stop_out, attention_weight = self.decode(step_input)
+
+            mel_outs.append(mel_out)
+            stop_tokens.append(stop_out)
+            attention_weights.append(attention_weight)
+
+        mel_outs = torch.stack(mel_outs, dim=1)
+        stop_tokens = torch.stack(stop_tokens, dim=1).squeeze()
+        attention_weights = torch.stack(attention_weights, dim=1)
+        mel_residual = self.postnet(mel_outs)
+
+        ### Mask ###
+        decoder_mask = decoder_mask.unsqueeze(-1).bool()
+        mel_outs = mel_outs.masked_fill(decoder_mask, 0.0)
+        mel_residual = mel_residual.masked_fill(decoder_mask, 0.0)
+        attention_weights = attention_weights.masked_fill(decoder_mask, 0.0)
+        stop_tokens = stop_tokens.masked_fill(decoder_mask.squeeze(), 1e3)
+
+        return mel_outs, mel_residual, stop_tokens, attention_weights
+    
+    @torch.inference_mode()
+    def inference(self, encoder_output, max_decode_steps=1000):
+
+        start_feature_vector = self._bos_frame(B=1).squeeze(0)
+
+        self._init_decoder(encoder_output, encoder_mask=None)
+
+        ### Create lists to store Intermediate Outputs ###
+        mel_outs, stop_outs, attention_weights = [], [], []
+
+        _input = start_feature_vector
+        self.attention.reset()
+
+        while True:
+
+            _input = self.prenet(_input)
+
+            mel_out, stop_out, attention_weight = self.decode(_input)
+
+            mel_outs.append(mel_out)
+            stop_outs.append(stop_out)
+            attention_weights.append(attention_weight)
+
+            if torch.sigmoid(stop_out) > 0.5:
+                break
+            elif len(mel_outs) >= max_decode_steps:
+                print("Reached Max Decoder Steps")
+                break
+
+            _input = mel_out
 
         mel_outs = torch.stack(mel_outs, dim=1)
         stop_outs = torch.stack(stop_outs, dim=1).squeeze()
-        attns = torch.stack(attns, dim=1)
+        attention_weights = torch.stack(attention_weights, dim=1)
+        mel_residual = self.postnet(mel_outs)
 
-        residual = self.postnet(mel_outs)
-
-        mel_outs = mel_outs.masked_fill(decoder_mask.unsqueeze(-1), 0.0)
-        residual = residual.masked_fill(decoder_mask.unsqueeze(-1), 0.0)
-        stop_outs = stop_outs.masked_fill(decoder_mask, 1e3)
-        attns = attns.masked_fill(decoder_mask.unsqueeze(-1), 0.0)
-
-        return mel_outs, mel_outs + residual, stop_outs, attns
-
-    ####################################################################
-    # Inference (Auto-regressive)
-    ####################################################################
-
-    @torch.inference_mode()
-    def inference(self, encoder_outputs, emotion_ids=None, max_decode_steps=1000):
-
-        device = encoder_outputs.device
-        self._init_decoder(encoder_outputs, encoder_mask=None, emotion_ids=emotion_ids)
-
-        mel_outs = []
-        stop_outs = []
-        attns = []
-
-        _input = torch.zeros(1, self.config.num_mels, device=device)
-        self.attention.reset()
-
-        for _ in range(max_decode_steps):
-
-            _input = self.prenet(_input)
-            mel_pred, stop_pred, attn = self.decode_step(_input)
-
-            mel_outs.append(mel_pred)
-            stop_outs.append(stop_pred)
-            attns.append(attn)
-
-            if torch.sigmoid(stop_pred) > 0.5:
-                break
-
-            _input = mel_pred
-
-        mel_outs = torch.stack(mel_outs, dim=1)
-        residual = self.postnet(mel_outs)
-
-        return mel_outs + residual, torch.stack(attns, dim=1)
-
-
-################################################################################
-# TACOTRON2 TOP
-################################################################################
+        return mel_outs, mel_residual, stop_outs, attention_weights
+        
 
 class Tacotron2(nn.Module):
-    def __init__(self, config: Tacotron2Config):
-        super().__init__()
+    def __init__(self, config):
+        super(Tacotron2, self).__init__()
 
         self.config = config
 
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
 
-        # === EMOTION MODULES (shared across entire model) ===
-        if config.num_emotions > 0 and config.emotion_embed_dim > 0:
-            self.emotion_embedding = nn.Embedding(config.num_emotions, config.emotion_embed_dim)
-            self.emotion_to_hidden = nn.Linear(config.emotion_embed_dim, config.decoder_embed_dim)
-
-            # connect modules directly to decoder
-            self.decoder.emotion_embedding = self.emotion_embedding
-            self.decoder.emotion_to_hidden = self.emotion_to_hidden
-
     def forward(self, text, input_lengths, mels, encoder_mask, decoder_mask, emotion_ids=None):
-        encoder_outputs = self.encoder(text, input_lengths)
 
-        return self.decoder(
-            encoder_outputs,
-            encoder_mask,
-            mels,
-            decoder_mask,
-            emotion_ids=emotion_ids
+        encoder_padded_outputs = self.encoder(text, input_lengths, emotion_ids=emotion_ids)
+        mel_outs, mel_residual, stop_tokens, attention_weights = self.decoder(
+            encoder_padded_outputs, encoder_mask, mels, decoder_mask
         )
 
-    @torch.inference_mode()
-    def inference(self, text, emotion_ids=None, max_decode_steps=1000):
+        mel_postnet_out = mel_outs + mel_residual
 
+        return mel_outs, mel_postnet_out, stop_tokens, attention_weights 
+    
+    @torch.inference_mode()
+    def inference(self, text, max_decode_steps=1000, emotion_id=None):
+        """
+        Args:
+            text: Input text token tensor
+            max_decode_steps: Maximum number of decoder steps
+            emotion_id: Optional emotion ID tensor (single value or tensor) for emotion conditioning
+        """
         if text.ndim == 1:
             text = text.unsqueeze(0)
 
-        assert text.size(0) == 1, "Only batch size 1 supported for inference"
-
-        encoder_outputs = self.encoder(text)
-
-        mel, attn = self.decoder.inference(
-            encoder_outputs,
-            emotion_ids=emotion_ids,
-            max_decode_steps=max_decode_steps
+        assert text.shape[0] == 1, "Inference only written for Batch Size of 1"
+        
+        # Handle emotion_id
+        if emotion_id is not None:
+            if isinstance(emotion_id, int):
+                emotion_id = torch.tensor([emotion_id], device=text.device, dtype=torch.long)
+            elif isinstance(emotion_id, torch.Tensor):
+                if emotion_id.ndim == 0:
+                    emotion_id = emotion_id.unsqueeze(0)
+        else:
+            emotion_id = None
+        
+        encoder_outputs = self.encoder(text, emotion_ids=emotion_id)
+        mel_outs, mel_residual, stop_outs, attention_weights = self.decoder.inference(
+            encoder_outputs, max_decode_steps=max_decode_steps
         )
 
-        return mel, attn
+        mel_postnet_out = mel_outs + mel_residual
+
+        return mel_postnet_out, attention_weights
+
+        
+if __name__ == "__main__":
+
+    from dataset import TTSDataset, TTSCollator
+
+    dataset = TTSDataset("data/test_metadata.csv")
+    loader = torch.utils.data.DataLoader(dataset, batch_size=4, collate_fn=TTSCollator())
+    for text_padded, input_lengths, mel_padded, gate_padded, encoder_mask, decoder_mask in loader:
+
+        config = Tacotron2Config()
+        model = Tacotron2(config)
+        print(model)
+        # decoder(encoded_outputs, )
+
+        break
