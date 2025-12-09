@@ -33,4 +33,4 @@ The training logs and progress plots can be found within the _output/_ directory
   
 
 ### Style Conditioning
-We also experimented with style-conditioned Tacotron2 by fine-tuning the base model on the [EmoV-DB](https://huggingface.co/datasets/CLAPv2/EmoV_DB/viewer) dataset _(tacotron2/style_conditioning)_. However, the results were not satisfactory. The mel predictions were unstable and the audio quality degraded.
+_(tacotron2/style_conditioning)_ - Style-conditioned Tacotron2 by fine-tuning the base model on the [EmoV-DB](https://huggingface.co/datasets/CLAPv2/EmoV_DB/viewer) dataset. 
